@@ -177,7 +177,7 @@ class Downloader(threading.Thread):
         self.control_socket = control_socket
 
     def run(self):
-        s = socket.socket()             
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)             
         host = socket.gethostname()    
         s.bind((host, 0))          
         s.listen(1)      
@@ -199,13 +199,13 @@ class Uploader(threading.Thread):
         self.control_socket = control_socket
         
     def run(self):
-        s = socket.socket()             
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)             
         host = socket.gethostname()
         msg = receive_socket_data(self.control_socket) 
         if msg and msg['type'] == TYPE_DOWNLOAD_PORT_READY:            
             s.connect((host, msg['port']))
 
-            print 'Got upload connection to {}: {}\n'.format(host, msg['port'])
+            print 'Got upload connection to {}: {}'.format(host, msg['port'])
             upload_files(self.to_upload, s)
             print 'Finished uploading'
         else:
@@ -231,28 +231,28 @@ def start_sync(current_files, peer_files, conn):
 
 
 current_files = get_current_files()
+connection = None
 
 if MODE == 'client':
     # client
     print 'CLIENT. Will connect to a peer.'
-    s = socket.socket()             
+    connection = socket.socket(socket.AF_INET, socket.SOCK_STREAM)             
     try:
-        s.connect((IP_ADDR, PORT))
+        connection.connect((IP_ADDR, PORT))
         print 'Connected to peer'
     except socket_error as serr:
         print '{}:{} is not open. Please check the connection.'.format(IP_ADDR, PORT)
         sys.exit(2)
 
-    peer_files = exchange_file_list(s, current_files)    
-    start_sync(current_files, peer_files, s)
 else:    
     # server
     print 'SERVER. Will wait for a peer.'
-    s = socket.socket()             
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)             
     s.bind((IP_ADDR, PORT))
     s.listen(1)                    
-    conn, addr = s.accept()
+    connection, addr = s.accept()
     print 'Got connection from {}'.format(addr)
 
-    peer_files = exchange_file_list(conn, current_files)
-    start_sync(current_files, peer_files, conn)
+
+peer_files = exchange_file_list(connection, current_files)    
+start_sync(current_files, peer_files, connection)
