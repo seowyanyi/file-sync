@@ -20,35 +20,40 @@ TYPE_DOWNLOAD_PORT_READY = 'TYPE_DOWNLOAD_PORT_READY'
 
 SHARED_FOLDER = None
 IP_ADDR = None
+MODE = None
 
 def usage():
-    print "usage: " + sys.argv[0] + " -p optional-peer-ip -s shared-folder-location"
+    print "usage: " + sys.argv[0] + " -p ip-address-of-server -m mode -s shared-folder-location\n"
 
-input_file_b = input_file_t = output_file = None
+def is_valid_ip(ip_addr):
+    return ip_addr and (ip_addr == 'localhost' or not not re.match(IPV4_RE, ip_addr))
+
 try:
-    opts, args = getopt.getopt(sys.argv[1:], 'p:s:')
+    opts, args = getopt.getopt(sys.argv[1:], 'p:m:s:')
 except getopt.GetoptError, err:
     usage()
     sys.exit(2)
 for o, a in opts:
     if o == '-p':
         IP_ADDR = a
+    elif o == '-m':
+        MODE = a        
     elif o == '-s':
         SHARED_FOLDER = a
     else:
-        assert False, "unhandled option"
-if SHARED_FOLDER == None:
+        print 'Unknown option "{}"'.format(o)
+        usage()
+        sys.exit(2)
+if SHARED_FOLDER == None or (MODE != 'client' and MODE != 'server') or not is_valid_ip(IP_ADDR):
     usage()
     sys.exit(2)
 
-def is_valid_ip(ip_addr):
-    return ip_addr and (ip_addr == 'localhost' or not not re.match(IPV4_RE, ip_addr))
 
 
-def receive_socket_data(socket):
+def receive_socket_data(conn):
     data_buffer = ''
     while True:
-        data = socket.recv(PACKET_SIZE)
+        data = conn.recv(PACKET_SIZE)
         if not data:
             try:
                 return json.loads(data_buffer)
@@ -88,51 +93,51 @@ def get_missing_files(a, b):
     return missing_files
 
 
-def upload_files(files, socket):
+def upload_files(files, conn):
     for fileObj in files:
         filename = fileObj['filename']        
         # Send file
         f = open(SHARED_FOLDER + filename,'r')
         data = f.read(PACKET_SIZE)
         while (data):
-           socket.send(data)
+           conn.send(data)
            data = f.read(PACKET_SIZE)
         f.close()
         print 'Sent file {}'.format(filename)
 
         # wait for acknowledgement
-        if receive_ACK(socket, filename):
+        if receive_ACK(conn, filename):
             print 'Peer received {}'.format(filename)
         else:
             print 'Did not receive'
 
 
-def download_files(files, socket):
+def download_files(files, conn):
     for fileObj in files:
         filename = fileObj['filename']
         filesize = fileObj['bytes']
         bytes_received = 0
         f = open(SHARED_FOLDER + filename, 'a')
         while True:
-            data = socket.recv(PACKET_SIZE)      
+            data = conn.recv(PACKET_SIZE)      
             bytes_received += sys.getsizeof(data)      
             if data:
                 f.write(data)
             if not data or bytes_received >= filesize:
                 break
         f.close()
-        send_ACK(socket, filename)
+        send_ACK(conn, filename)
         print 'Downloaded {}'.format(filename)
 
 
 
-def receive_ACK(socket, payload):
-    msg = receive_socket_data(socket)
+def receive_ACK(conn, payload):
+    msg = receive_socket_data(conn)
     return msg and msg['type'] == TYPE_ACK and msg['hash'] == payload
 
 
-def send_ACK(socket, payload):
-    socket.send(json.dumps({'type': TYPE_ACK, 'hash': payload}))
+def send_ACK(conn, payload):
+    conn.send(json.dumps({'type': TYPE_ACK, 'hash': payload}))
 
 
 def add_size(f):
@@ -144,22 +149,22 @@ def get_current_files():
     return map(add_size, current_files)
 
 
-def exchange_file_list(socket, current_files):
+def exchange_file_list(conn, current_files):
     # Send file list 
-    socket.send(json.dumps({'type': TYPE_INIT, 'files': current_files}))
+    conn.send(json.dumps({'type': TYPE_INIT, 'files': current_files}))
 
     # Receive file list
-    msg = receive_socket_data(socket)
+    msg = receive_socket_data(conn)
     peer_files = msg['files']
 
     received_list_hash = hash_list(peer_files)
 
     # Acknowledge received list
-    send_ACK(socket, received_list_hash)
+    send_ACK(conn, received_list_hash)
 
     # Wait for acknowledgement of its own list sent out
     sent_list_hash = hash_list(current_files)
-    if receive_ACK(socket, sent_list_hash):
+    if receive_ACK(conn, sent_list_hash):
         print 'File list exchanged'
         return peer_files
     else:
@@ -207,7 +212,7 @@ class Uploader(threading.Thread):
             print 'Something went wrong'
 
 
-def start_sync(current_files, peer_files, socket):
+def start_sync(current_files, peer_files, conn):
     print 'start sync'
     to_upload = get_missing_files(peer_files, current_files)
     to_download = get_missing_files(current_files, peer_files)
@@ -217,22 +222,22 @@ def start_sync(current_files, peer_files, socket):
         return
 
     if len(to_upload) > 0:
-        uploader = Uploader(to_upload, socket)
+        uploader = Uploader(to_upload, conn)
         uploader.start()
 
     if len(to_download) > 0:
-        downloader = Downloader(to_download, socket)
+        downloader = Downloader(to_download, conn)
         downloader.start()
+
 
 current_files = get_current_files()
 
-if is_valid_ip(IP_ADDR):
+if MODE == 'client':
     # client
     print 'CLIENT. Will connect to a peer.'
     s = socket.socket()             
-    host = socket.gethostname()     
     try:
-        s.connect((host, PORT))
+        s.connect((IP_ADDR, PORT))
         print 'Connected to peer'
     except socket_error as serr:
         print '{}:{} is not open. Please check the connection.'.format(IP_ADDR, PORT)
@@ -244,8 +249,7 @@ else:
     # server
     print 'SERVER. Will wait for a peer.'
     s = socket.socket()             
-    host = socket.gethostname()    
-    s.bind((host, PORT))          
+    s.bind((IP_ADDR, PORT))
     s.listen(1)                    
     conn, addr = s.accept()
     print 'Got connection from {}'.format(addr)
