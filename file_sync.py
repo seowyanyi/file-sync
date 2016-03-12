@@ -9,14 +9,16 @@ from os.path import isfile, join
 import threading
 from socket import error as socket_error
 import time
+import select
 
 PACKET_SIZE = 4096
 IPV4_RE = r'^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])$'
-PORT = 60001                    
+CONTROL_PORT = 60002                    
+FILE_TRANSFER_PORT = 50002
 
 TYPE_ACK = 'TYPE_ACK'
 TYPE_INIT = 'TYPE_INIT'
-TYPE_DOWNLOAD_PORT_READY = 'TYPE_DOWNLOAD_PORT_READY'
+TYPE_PORT_READY = 'TYPE_PORT_READY'
 
 SHARED_FOLDER = None
 IP_ADDR = None
@@ -51,6 +53,10 @@ if SHARED_FOLDER == None or (MODE != 'client' and MODE != 'server') or not is_va
 
 
 def receive_socket_data(conn):
+    """
+    Receives socket data in json format.
+    Parses the JSON and returns the deserialized python object.
+    """
     data_buffer = ''
     while True:
         data = conn.recv(PACKET_SIZE)
@@ -91,43 +97,6 @@ def get_missing_files(a, b):
         if not is_file_in_list(f['filename'], a):
             missing_files.append(f)
     return missing_files
-
-
-def upload_files(files, conn):
-    for fileObj in files:
-        filename = fileObj['filename']        
-        # Send file
-        f = open(SHARED_FOLDER + filename,'r')
-        data = f.read(PACKET_SIZE)
-        while (data):
-           conn.send(data)
-           data = f.read(PACKET_SIZE)
-        f.close()
-        print 'Sent file {}'.format(filename)
-
-        # wait for acknowledgement
-        if receive_ACK(conn, filename):
-            print 'Peer received {}'.format(filename)
-        else:
-            print 'Did not receive'
-
-
-def download_files(files, conn):
-    for fileObj in files:
-        filename = fileObj['filename']
-        filesize = fileObj['bytes']
-        bytes_received = 0
-        f = open(SHARED_FOLDER + filename, 'a')
-        while True:
-            data = conn.recv(PACKET_SIZE)      
-            bytes_received += sys.getsizeof(data)      
-            if data:
-                f.write(data)
-            if not data or bytes_received >= filesize:
-                break
-        f.close()
-        send_ACK(conn, filename)
-        print 'Downloaded {}'.format(filename)
 
 
 
@@ -171,49 +140,105 @@ def exchange_file_list(conn, current_files):
         raise AssertionError('Error receiving ACK')
 
 class Downloader(threading.Thread):
-    def __init__(self, to_download, control_socket):
+    def __init__(self, to_download, file_socket, control_socket):
         threading.Thread.__init__(self)
         self.to_download = to_download
         self.control_socket = control_socket
+        self.file_socket = file_socket
+
+    def download_files(self, files):
+        for fileObj in files:
+            filename = fileObj['filename']
+            filesize = fileObj['bytes']
+            bytes_received = 0
+            f = open(SHARED_FOLDER + filename, 'a')
+            while True:
+                data = self.file_socket.recv(PACKET_SIZE)      
+                bytes_received += sys.getsizeof(data)      
+
+                if data:
+                    f.write(data)
+
+                if not data or bytes_received >= filesize:
+                    break
+                else:
+                    send_ACK(self.control_socket, 'received_byte')
+
+            f.close()
+            send_ACK(self.control_socket, filename)
+            print 'Downloaded {}'.format(filename)
 
     def run(self):
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)             
-        host = socket.gethostname()    
-        s.bind((host, 0))          
-        s.listen(1)      
-        port = s.getsockname()[1]
-        self.control_socket.send(json.dumps({'type': TYPE_DOWNLOAD_PORT_READY, 'port': port}))
-
-        conn, addr = s.accept()
-
-        print 'Got download connection from {}'.format(addr)
-        download_files(self.to_download, conn)
+        self.download_files(self.to_download)
         print 'Finished downloading'
 
 
-
 class Uploader(threading.Thread):
-    def __init__(self, to_upload, control_socket):
+    def __init__(self, to_upload, file_socket, control_socket):
         threading.Thread.__init__(self)
         self.to_upload = to_upload
-        self.control_socket = control_socket
+        self.control_socket = control_socket        
+        self.file_socket = file_socket
         
+    def upload_files(self, files):
+        for fileObj in files:
+            filename = fileObj['filename']        
+            # Send file
+            f = open(SHARED_FOLDER + filename,'r')
+            data = f.read(PACKET_SIZE)
+            while data:
+               self.file_socket.send(data)
+               data = f.read(PACKET_SIZE)
+               if data:
+                   receive_ACK(self.control_socket, 'received_byte')
+
+            f.close()
+            print 'Uploaded file {}'.format(filename)
+
+            # wait for acknowledgement
+            if receive_ACK(self.control_socket, filename):
+                print 'Peer received {}'.format(filename)
+
     def run(self):
+        self.upload_files(self.to_upload)
+        print 'Finished uploading'
+
+def get_connection(port, control_socket=None):
+    if MODE == 'client':
+        if control_socket:
+            # Wait for signal that file port is ready
+            msg = receive_socket_data(control_socket)
+            if msg['type'] != TYPE_PORT_READY:
+                print 'Error: Did not receive port ready signal'
+                print msg
+                sys.exit(2)
+
+        # client
+        print 'CLIENT. Will connect to a peer on port {}.'.format(port)
+        connection = socket.socket(socket.AF_INET, socket.SOCK_STREAM)             
+        try:
+            connection.connect((IP_ADDR, port))
+            print 'Connected to peer'
+            return connection
+        except socket_error as serr:
+            print 'Cannot connect to {}:{}. Please check that the server is up.'.format(IP_ADDR, port)
+            sys.exit(2)
+
+    else:    
+        # server        
+        print 'SERVER. Will wait for a peer on port {}.'.format(port)
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)             
-        host = socket.gethostname()
-        msg = receive_socket_data(self.control_socket) 
-        if msg and msg['type'] == TYPE_DOWNLOAD_PORT_READY:            
-            s.connect((host, msg['port']))
+        s.bind((IP_ADDR, port))
+        s.listen(1)
+        if control_socket:
+            control_socket.send(json.dumps({'type': TYPE_PORT_READY}))
 
-            print 'Got upload connection to {}: {}'.format(host, msg['port'])
-            upload_files(self.to_upload, s)
-            print 'Finished uploading'
-        else:
-            print 'Something went wrong'
+        connection, addr = s.accept()
+        print 'Got connection from {}'.format(addr)
+        return connection
 
 
-def start_sync(current_files, peer_files, conn):
-    print 'start sync'
+def start_sync(current_files, peer_files, control_socket):
     to_upload = get_missing_files(peer_files, current_files)
     to_download = get_missing_files(current_files, peer_files)
 
@@ -221,38 +246,19 @@ def start_sync(current_files, peer_files, conn):
         print 'Already synchronized.'
         return
 
+    file_socket = get_connection(FILE_TRANSFER_PORT, control_socket)
+
     if len(to_upload) > 0:
-        uploader = Uploader(to_upload, conn)
+        print 'should upload {}'.format(to_upload)
+        uploader = Uploader(to_upload, file_socket, control_socket)
         uploader.start()
 
     if len(to_download) > 0:
-        downloader = Downloader(to_download, conn)
+        print 'should download {}'.format(to_download)        
+        downloader = Downloader(to_download, file_socket, control_socket)
         downloader.start()
 
-
 current_files = get_current_files()
-connection = None
-
-if MODE == 'client':
-    # client
-    print 'CLIENT. Will connect to a peer.'
-    connection = socket.socket(socket.AF_INET, socket.SOCK_STREAM)             
-    try:
-        connection.connect((IP_ADDR, PORT))
-        print 'Connected to peer'
-    except socket_error as serr:
-        print '{}:{} is not open. Please check the connection.'.format(IP_ADDR, PORT)
-        sys.exit(2)
-
-else:    
-    # server
-    print 'SERVER. Will wait for a peer.'
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)             
-    s.bind((IP_ADDR, PORT))
-    s.listen(1)                    
-    connection, addr = s.accept()
-    print 'Got connection from {}'.format(addr)
-
-
-peer_files = exchange_file_list(connection, current_files)    
-start_sync(current_files, peer_files, connection)
+control_socket = get_connection(CONTROL_PORT)
+peer_files = exchange_file_list(control_socket, current_files)    
+start_sync(current_files, peer_files, control_socket)
