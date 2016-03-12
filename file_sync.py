@@ -112,9 +112,17 @@ def send_ACK(conn, payload):
     conn.send(json.dumps({'type': TYPE_ACK, 'hash': payload}))
 
 
-def add_size(f):
-    statinfo = os.stat(SHARED_FOLDER + f)
-    return {'filename': f, 'bytes': statinfo.st_size}
+def add_size(filename):
+    f = open(SHARED_FOLDER + filename,'r')
+    data = f.read(PACKET_SIZE)
+    bytes_to_send = sys.getsizeof(data)    
+    while data:
+        data = f.read(PACKET_SIZE)
+        if data:
+            bytes_to_send += sys.getsizeof(data)
+
+    f.close()
+    return {'filename': filename, 'bytes': bytes_to_send}
 
 def get_current_files():
     current_files = [f for f in os.listdir(SHARED_FOLDER) if isfile(join(SHARED_FOLDER, f))]
@@ -161,7 +169,6 @@ class Downloader(threading.Thread):
             f = open(SHARED_FOLDER + filename, 'a')
             self.file = f
             self.file_in_progress = filename
-            print 'Downloading {}'.format(self.file_in_progress)
             while True:
                 data = self.file_socket.recv(PACKET_SIZE)      
                 bytes_received += sys.getsizeof(data)      
@@ -170,15 +177,14 @@ class Downloader(threading.Thread):
                     f.write(data)
                 if not data or bytes_received >= filesize:
                     break
-                else:
-                    send_ACK(self.control_socket, 'received_byte')
             
             f.close()
             if bytes_received >= filesize:
                 self.file = None            
                 self.file_in_progress = None
                 send_ACK(self.control_socket, filename)
-                print 'Downloaded {}'.format(filename)
+                print 'Downloaded {}...................... {} %'.format(filename, float(bytes_received)/filesize*100)                    
+
             else:
                 print 'Error. Received {} bytes out of {} bytes'.format(bytes_received, filesize)
                 self.file.close()
@@ -223,14 +229,13 @@ class Uploader(threading.Thread):
             # Send file
             f = open(SHARED_FOLDER + filename,'r')
             data = f.read(PACKET_SIZE)
+
             while data:
                self.file_socket.send(data)
                data = f.read(PACKET_SIZE)
-               if data:
-                   receive_ACK(self.control_socket, 'received_byte')
 
             f.close()
-            print 'Uploaded file {}'.format(filename)
+            print 'Uploaded file {}.'.format(filename)
 
             # wait for acknowledgement
             if receive_ACK(self.control_socket, filename):
