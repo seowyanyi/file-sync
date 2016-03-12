@@ -10,6 +10,7 @@ import threading
 from socket import error as socket_error
 import time
 import select
+import errno
 
 PACKET_SIZE = 4096
 IPV4_RE = r'^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])$'
@@ -49,7 +50,9 @@ for o, a in opts:
 if SHARED_FOLDER == None or (MODE != 'client' and MODE != 'server') or not is_valid_ip(IP_ADDR):
     usage()
     sys.exit(2)
-
+else:
+    if SHARED_FOLDER[len(SHARED_FOLDER) - 1] != '/':
+        SHARED_FOLDER += '/'
 
 
 def receive_socket_data(conn):
@@ -147,30 +150,64 @@ class Downloader(threading.Thread):
         self.file_socket = file_socket
 
     def download_files(self, files):
+        self.file = None
+        self.file_in_progress = None
+
         for fileObj in files:
             filename = fileObj['filename']
             filesize = fileObj['bytes']
             bytes_received = 0
+
             f = open(SHARED_FOLDER + filename, 'a')
+            self.file = f
+            self.file_in_progress = filename
+            print 'Downloading {}'.format(self.file_in_progress)
             while True:
                 data = self.file_socket.recv(PACKET_SIZE)      
                 bytes_received += sys.getsizeof(data)      
 
                 if data:
                     f.write(data)
-
                 if not data or bytes_received >= filesize:
                     break
                 else:
                     send_ACK(self.control_socket, 'received_byte')
-
+            
             f.close()
-            send_ACK(self.control_socket, filename)
-            print 'Downloaded {}'.format(filename)
+            if bytes_received >= filesize:
+                self.file = None            
+                self.file_in_progress = None
+                send_ACK(self.control_socket, filename)
+                print 'Downloaded {}'.format(filename)
+            else:
+                print 'Error. Received {} bytes out of {} bytes'.format(bytes_received, filesize)
+                self.file.close()
+                os.remove(SHARED_FOLDER + self.file_in_progress)
+                print 'Deleted incomplete download {}'.format(self.file_in_progress)
 
     def run(self):
-        self.download_files(self.to_download)
-        print 'Finished downloading'
+        try:        
+            self.download_files(self.to_download)
+            print 'Finished downloading'
+        except socket_error, e:
+            if isinstance(e.args, tuple):
+                if e[0] == errno.EPIPE:
+                   # remote peer disconnected
+                   print "Downloader: Detected remote disconnect"
+                elif e[0] == "timed out":
+                    print 'Downloader: Connection timed out.'
+                else:
+                    print "errno is {}".format(e[0])                    
+            else:
+                print "socket error ", e      
+
+            # Delete incomplete downloads
+            print 'Incomplete: {}'.format(self.file_in_progress)
+            if self.file_in_progress and self.file:
+                self.file.close()
+                os.remove(SHARED_FOLDER + self.file_in_progress)
+                print 'Deleted incomplete download {}'.format(self.file_in_progress)
+
 
 
 class Uploader(threading.Thread):
@@ -200,8 +237,22 @@ class Uploader(threading.Thread):
                 print 'Peer received {}'.format(filename)
 
     def run(self):
-        self.upload_files(self.to_upload)
-        print 'Finished uploading'
+        try:
+            self.upload_files(self.to_upload)
+            print 'Finished uploading'
+        except socket_error, e:
+            if isinstance(e.args, tuple):
+                if e[0] == errno.EPIPE:
+                   # remote peer disconnected
+                   print "Uploader: Detected remote disconnect"
+                elif e[0] == "timed out":
+                    print 'Uploader: Connection timed out.'  
+                else:
+                    print "errno is {}".format(e[0])
+
+            else:
+                print "socket error ", e
+
 
 def get_connection(port, control_socket=None):
     if MODE == 'client':
@@ -247,18 +298,24 @@ def start_sync(current_files, peer_files, control_socket):
         return
 
     file_socket = get_connection(FILE_TRANSFER_PORT, control_socket)
+    file_socket.settimeout(10.0)
 
     if len(to_upload) > 0:
-        print 'should upload {}'.format(to_upload)
+        print 'Should upload {}'.format(to_upload)
         uploader = Uploader(to_upload, file_socket, control_socket)
         uploader.start()
 
     if len(to_download) > 0:
-        print 'should download {}'.format(to_download)        
+        print 'Should download {}'.format(to_download)        
         downloader = Downloader(to_download, file_socket, control_socket)
         downloader.start()
 
 current_files = get_current_files()
 control_socket = get_connection(CONTROL_PORT)
-peer_files = exchange_file_list(control_socket, current_files)    
-start_sync(current_files, peer_files, control_socket)
+control_socket.settimeout(10.0)
+    
+try:
+    peer_files = exchange_file_list(control_socket, current_files)    
+    start_sync(current_files, peer_files, control_socket)
+except socket.timeout:
+    print 'Connection timed out.'
